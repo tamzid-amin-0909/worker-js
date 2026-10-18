@@ -104,6 +104,42 @@ function text(body, status, extra) {
   return new Response(body, { status, headers: { "Content-Type": "text/plain", ...extra } });
 }
 
+// Reads exactly `n` bytes from a stream, then cancels it (used when upstream ignores Range)
+async function readExact(body, n) {
+  const reader = body.getReader();
+  const out = new Uint8Array(n);
+  let got = 0;
+  while (got < n) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const take = Math.min(value.length, n - got);
+    out.set(value.subarray(0, take), got);
+    got += take;
+  }
+  reader.cancel().catch(() => {});
+  return out.subarray(0, got);
+}
+
+// upstream fetch with retries on network errors / 5xx / 429
+async function fetchRetry(url, init, tries = 3) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, init);
+      if (r.status < 500 && r.status !== 429) return r;
+      last = r;
+      if (i < tries - 1) {
+        try { r.body && r.body.cancel(); } catch (e) {}
+      }
+    } catch (e) {
+      last = e;
+    }
+    await new Promise((res) => setTimeout(res, 250 * (i + 1)));
+  }
+  if (last instanceof Response) return last;
+  throw last;
+}
+
 // ═══════════════════════════════════════════════════════════════
 export default {
   async fetch(request, env) {
@@ -149,7 +185,7 @@ async function handlePost(request, c) {
   // ── quality list: read the master playlist server-side ──
   if (body.a === "q") {
     const dir = url.substring(0, url.lastIndexOf("/"));
-    const r = await fetch(dir + "/playlist.m3u8", { headers: c.upstream });
+    const r = await fetchRetry(dir + "/playlist.m3u8", { headers: c.upstream });
     const txt = await r.text();
 
     let heights = [...txt.matchAll(/RESOLUTION=\d+x(\d+)/gi)].map((m) => +m[1]);
@@ -170,13 +206,30 @@ async function handlePost(request, c) {
     return text("Bad request", 400);
   }
   end = Math.min(end, start + MAX_CHUNK - 1);
+  const want = end - start + 1;
 
-  const up = await fetch(url, { headers: { ...c.upstream, Range: `bytes=${start}-${end}` } });
+  const up = await fetchRetry(url, { headers: { ...c.upstream, Range: `bytes=${start}-${end}` } });
   const cr = up.headers.get("content-range");
-  if (up.status !== 206 || !cr) return text("Upstream HTTP " + up.status, 502);
+  const cl = up.headers.get("content-length");
 
-  const total = parseInt(cr.split("/")[1], 10);
-  const plain = new Uint8Array(await up.arrayBuffer());
+  let plain, total;
+
+  if (up.status === 206 && cr) {
+    total = parseInt(cr.split("/")[1], 10);
+    plain = new Uint8Array(await up.arrayBuffer());
+  } else if (up.status === 200 && start === 0 && cl && up.body) {
+    // upstream ignored the Range header: take just the first bytes of the stream
+    total = parseInt(cl, 10);
+    plain = await readExact(up.body, Math.min(want, total));
+  } else {
+    // detailed error so you can see exactly what Bunny answered
+    let snippet = "";
+    if (up.status >= 400) snippet = (await up.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 120);
+    return text(
+      `Upstream HTTP ${up.status} | asked bytes=${start}-${end} | content-range=${cr || "-"} | content-length=${cl || "-"} | ${snippet}`,
+      up.status === 416 ? 416 : 502,
+    );
+  }
 
   // AES-128-CTR, counter = nonce(8) || uint64be(blockIndex)
   const counter = new Uint8Array(16);
@@ -208,7 +261,7 @@ async function handlePost(request, c) {
 // ═══════════════════════════════════════════════════════════════
 async function handleHls(request, c) {
   const raw = new URL(request.url).searchParams.get("url") || "";
-  if (!raw) return text("Missing url", 400);
+  if (!raw) return text("Nice try buddy🤣", 400);
 
   const url = await aesDecrypt(c, raw);
   if (!url) return text("Invalid or corrupted encrypted URL", 400);
