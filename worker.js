@@ -7,7 +7,7 @@
 //   ALLOWED_ORIGINS          comma separated, e.g. https://everythingfree.iceiy.com
 //   UPSTREAM_REFERER         defaults to https://iframe.mediadelivery.net
 
-const MAX_CHUNK = 2 * 1024 * 1024;
+const MAX_CHUNK = 4 * 1024 * 1024;
 const HOST_RE = /^vz-[a-z0-9-]+\.b-cdn\.net$/i;
 
 const enc = new TextEncoder();
