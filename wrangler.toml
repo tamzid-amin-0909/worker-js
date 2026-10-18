@@ -1,4 +1,4 @@
-# wrangler.toml
-name = 'alllwebsecurityby'
+name = "alllwebsecurityby"
 main = "worker.js"
-compatibility_date = "2026-12-10"
+compatibility_date = "2026-10-18"
+compatibility_flags = ["nodejs_compat"]
